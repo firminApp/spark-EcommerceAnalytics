@@ -1,0 +1,24 @@
+# --- Artefacts de compilation ------------------------------------------------
+target/
+project/target/
+project/project/
+**/target/
+
+# --- IDE ---------------------------------------------------------------------
+.idea/
+.bsp/
+.metals/
+.bloop/
+*.iml
+
+# --- Système -----------------------------------------------------------------
+.DS_Store
+
+# --- Logs et sorties temporaires ---------------------------------------------
+*.log
+spark-warehouse/
+metastore_db/
+derby.log
+
+# --- Livrable binaire (reconstruit par sbt assembly) --------------------------
+dist/
