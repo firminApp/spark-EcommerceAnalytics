@@ -173,12 +173,84 @@ class DataTransformation(spark: SparkSession, config: ConfigLoader) extends Seri
       .withColumn("days_since_previous_purchase", datediff(col("tx_date"), col("previous_tx_date")))
   }
 
-  /** Pipeline de la Partie 3, dans l'ordre impose par l'enonce. */
+  // ==========================================================================
+  //  Bonus 3.4 — détection de transactions suspectes
+  // ==========================================================================
+
+  /**
+   * Ajoute `avg_amount_user`, `amount_deviation_pct` puis `is_suspicious`.
+   *
+   * `is_suspicious = 1` dès que **au moins deux** des quatre signaux suivants
+   * sont réunis (seuils externalisés dans `application.conf`) :
+   *   1. montant supérieur de plus de 300 % au panier moyen de l'utilisateur ;
+   *   2. transaction en période « Night » ;
+   *   3. moins de 5 minutes depuis la transaction précédente du même client ;
+   *   4. paiement en CRYPTO.
+   *
+   * Le panier moyen est calculé sur **toute** l'historique de l'utilisateur
+   * (fenêtre non bornée), conformément à « montant moyen historique ».
+   */
+  def detectSuspiciousTransactions(df: DataFrame): DataFrame = {
+    val wUser = Window.partitionBy("user_id")
+
+    val enriched = df
+      .withColumn("avg_amount_user", avg(col("amount")).over(wUser))
+      .withColumn(
+        "amount_deviation_pct",
+        round(
+          when(col("avg_amount_user") > 0,
+            (col("amount") - col("avg_amount_user")) / col("avg_amount_user") * 100.0
+          ).otherwise(lit(null).cast("double")),
+          2
+        )
+      )
+      .withColumn(
+        "seconds_since_previous_purchase",
+        when(col("previous_tx_epoch").isNotNull, col("tx_epoch") - col("previous_tx_epoch"))
+      )
+
+    val c1 = when(col("amount_deviation_pct") > lit(config.suspiciousDeviationPct), 1).otherwise(0)
+    val c2 = when(col("day_period") === lit("Night"), 1).otherwise(0)
+    val c3 = when(col("seconds_since_previous_purchase") < lit(config.suspiciousMaxDelaySeconds), 1).otherwise(0)
+    val c4 = when(upper(col("payment_method")) === lit(config.riskyPaymentMethod.toUpperCase), 1).otherwise(0)
+
+    enriched
+      .withColumn("nb_signaux_suspects", c1 + c2 + c3 + c4)
+      .withColumn(
+        "is_suspicious",
+        when(col("nb_signaux_suspects") >= lit(config.suspiciousMinConditions), lit(1)).otherwise(lit(0))
+      )
+  }
+
+  /** Affichage console demandé par le bonus 3.4. */
+  def showSuspiciousSummary(df: DataFrame): Unit = {
+    val suspects = df.filter(col("is_suspicious") === 1)
+    val n        = suspects.count()
+    println("=" * 100)
+    println(s"BONUS 3.4 — TRANSACTIONS SUSPECTES DÉTECTÉES : $n")
+    println("=" * 100)
+    suspects
+      .select(
+        "transaction_id", "user_id", "merchant_id", "amount", "avg_amount_user",
+        "amount_deviation_pct", "day_period", "seconds_since_previous_purchase",
+        "payment_method", "nb_signaux_suspects"
+      )
+      .orderBy(col("amount").desc)
+      .show(20, truncate = false)
+  }
+
+  /**
+   * Pipeline complet de la Partie 3, dans l'ordre imposé par l'énoncé.
+   * `withSuspicious` permet de désactiver le bonus 3.4 (Question 6.2).
+   */
   def run(
       transactions: DataFrame,
       users: DataFrame,
       products: DataFrame,
-      merchants: DataFrame
-  ): DataFrame =
-    addWindowAnalytics(enrichTransactionData(transactions, users, products, merchants))
+      merchants: DataFrame,
+      withSuspicious: Boolean = true
+  ): DataFrame = {
+    val enriched = addWindowAnalytics(enrichTransactionData(transactions, users, products, merchants))
+    if (withSuspicious) detectSuspiciousTransactions(enriched) else enriched
+  }
 }
