@@ -152,4 +152,126 @@ class Analytics(spark: SparkSession, config: ConfigLoader) extends Serializable 
       .agg(first(col("taux_retention_pct")))
       .orderBy("cohort_month")
 
+  // ==========================================================================
+  //  Bonus 4.3 — segmentation RFM
+  // ==========================================================================
+
+  /** Résultats de la segmentation RFM. */
+  case class RfmResult(scores: DataFrame, distribution: DataFrame, crossTab: DataFrame)
+
+  /**
+   * Récence / Fréquence / Montant, scorés de 1 à 5 par quintiles (`ntile`).
+   *
+   * Convention de score : pour la récence, **plus le nombre de jours est petit,
+   * meilleur est le client** — le tri est donc décroissant afin que le score 5
+   * corresponde toujours au meilleur profil sur les trois axes.
+   *
+   * Règles d'affectation retenues par le groupe (à justifier en soutenance) :
+   *   - Champions      : R ≥ 4 et F ≥ 4 et M ≥ 4 — récents, fréquents, dépensiers ;
+   *   - Clients fidèles: F ≥ 4 et R ≥ 3 — reviennent régulièrement ;
+   *   - Nouveaux       : R ≥ 4 et F ≤ 2 — arrivés récemment, peu d'historique ;
+   *   - À risque       : R ≤ 2 et F ≥ 3 — bons clients qui ne reviennent plus ;
+   *   - Perdus         : le reste (R ≤ 2 et F ≤ 2 principalement).
+   * L'ordre d'évaluation est important : la première règle satisfaite gagne.
+   */
+  def rfmSegmentation(enriched: DataFrame): RfmResult = {
+    // Date de référence = date la plus récente du jeu de données (et non la date
+    // du jour) : la récence reste ainsi reproductible d'une exécution à l'autre.
+    val refRow = enriched.agg(max(col("tx_date"))).head()
+    val refDate =
+      if (refRow.isNullAt(0)) java.sql.Date.valueOf(java.time.LocalDate.now())
+      else refRow.getDate(0)
+
+    val rfm = enriched
+      .filter(col("user_id").isNotNull && col("tx_date").isNotNull)
+      .groupBy("user_id")
+      .agg(
+        max(col("tx_date")).as("derniere_transaction"),
+        count(lit(1)).as("frequence"),
+        r2(sum("amount")).as("montant")
+      )
+      .withColumn("recence_jours", datediff(lit(refDate), col("derniere_transaction")))
+
+    val q = config.rfmQuantiles
+    val scored = rfm
+      .withColumn("score_r", ntile(q).over(Window.orderBy(col("recence_jours").desc)))
+      .withColumn("score_f", ntile(q).over(Window.orderBy(col("frequence").asc)))
+      .withColumn("score_m", ntile(q).over(Window.orderBy(col("montant").asc)))
+      .withColumn("score_rfm", concat(col("score_r"), col("score_f"), col("score_m")))
+      .withColumn(
+        "segment_rfm",
+        when(col("score_r") >= 4 && col("score_f") >= 4 && col("score_m") >= 4, lit("Champions"))
+          .when(col("score_f") >= 4 && col("score_r") >= 3, lit("Clients fideles"))
+          .when(col("score_r") >= 4 && col("score_f") <= 2, lit("Nouveaux"))
+          .when(col("score_r") <= 2 && col("score_f") >= 3, lit("A risque"))
+          .otherwise(lit("Perdus"))
+      )
+
+    val distribution = scored
+      .groupBy("segment_rfm")
+      .agg(
+        count(lit(1)).as("nb_clients"),
+        r2(avg("recence_jours")).as("recence_moyenne_jours"),
+        r2(avg("frequence")).as("frequence_moyenne"),
+        r2(avg("montant")).as("montant_moyen")
+      )
+      .orderBy(col("nb_clients").desc)
+
+    // Tableau croisé segment RFM calculé × customer_segment déclaré dans users.json.
+    val declared = enriched.select("user_id", "customer_segment").distinct()
+    val crossTab = scored
+      .join(declared, Seq("user_id"), "left")
+      .groupBy("segment_rfm")
+      .pivot("customer_segment")
+      .agg(count(lit(1)))
+      .na.fill(0L)
+      .orderBy("segment_rfm")
+
+    RfmResult(scored, distribution, crossTab)
+  }
+
+  // ==========================================================================
+  //  Bonus 4.4 — analyse produits et catégories
+  // ==========================================================================
+
+  case class ProductResult(topProduits: DataFrame, parCategorieRegion: DataFrame, parPaiementPeriode: DataFrame)
+
+  def productAnalysis(enriched: DataFrame): ProductResult = {
+    // 1. Top N produits par chiffre d'affaires.
+    val topProduits = enriched
+      .groupBy("product_id", "product_name", "product_category")
+      .agg(
+        r2(sum("amount")).as("chiffre_affaires"),
+        count(lit(1)).as("nb_transactions"),
+        r2(avg("product_rating")).as("note_moyenne"),
+        max(col("product_stock")).as("stock_disponible")
+      )
+      .orderBy(col("chiffre_affaires").desc)
+      .limit(config.topProducts)
+
+    // 2. CA et volumétrie par catégorie et par région, avec le poids relatif
+    //    de chaque catégorie dans sa région (fonction de fenêtrage).
+    val wRegion = Window.partitionBy("merchant_region")
+    val parCategorieRegion = enriched
+      .groupBy("merchant_region", "category")
+      .agg(
+        r2(sum("amount")).as("chiffre_affaires"),
+        count(lit(1)).as("nb_transactions")
+      )
+      .withColumn("ca_region", sum(col("chiffre_affaires")).over(wRegion))
+      .withColumn("part_dans_region_pct", r2(col("chiffre_affaires") * 100.0 / col("ca_region")))
+      .orderBy(col("merchant_region"), col("chiffre_affaires").desc)
+
+    // 3. Répartition du CA par méthode de paiement et période de la journée.
+    val parPaiementPeriode = enriched
+      .groupBy("payment_method", "day_period")
+      .agg(
+        r2(sum("amount")).as("chiffre_affaires"),
+        count(lit(1)).as("nb_transactions"),
+        r2(avg("amount")).as("montant_moyen")
+      )
+      .orderBy(col("payment_method"), col("chiffre_affaires").desc)
+
+    ProductResult(topProduits, parCategorieRegion, parPaiementPeriode)
+  }
 }
