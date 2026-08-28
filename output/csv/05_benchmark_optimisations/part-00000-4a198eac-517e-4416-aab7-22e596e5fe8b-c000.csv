@@ -1,0 +1,6 @@
+etape,duree_sans_optimisation_ms,duree_avec_optimisation_ms,gain_pct
+ingestion,21942,7705,64.88
+transformation,1591,8812,-453.87
+analytique,22197,12391,44.18
+ecriture,43279,19184,55.67
+TOTAL,89009,48092,45.97

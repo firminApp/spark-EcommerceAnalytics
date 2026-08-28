@@ -1,0 +1,9 @@
+dataset,regle,nb_lignes
+merchants,commission hors [0.0;1.0],14
+products,note hors [1.0;5.0],95
+products,prix <= 0.0,85
+transactions,montant <= 0.0,1200
+transactions,timestamp != 14 caracteres,700
+transactions,timestamp non numerique,276
+users,age hors [16;100],220
+users,revenu annuel <= 0.0,130
