@@ -9,13 +9,9 @@ Système d'analyse de données e-commerce distribué
 
 | Rôle | Nom, prénom | Adresse e-mail | Nom configuré dans Git (`git config user.name`) |
 |---|---|---|---|
-| **Membre A** — Data Ingestion & Platform Engineer | BANIGANTE Kpapou | kpapou.banigante@gozem.co | `Kpapou BANIGANTE` |
-| **Membre B** — Data Transformation Engineer | CAMARA Oumar | ⚠️ **À COMPLÉTER AVANT L'ENVOI** | `Oumar CAMARA` |
-| **Membre C** — Analytics & Performance Engineer | CHAKVOURNE Frédéric | ⚠️ **À COMPLÉTER AVANT L'ENVOI** | `Frederic CHAKVOURNE` |
-
-> ⚠️ **Action requise avant l'envoi du ZIP** : remplacer les deux mentions
-> « À COMPLÉTER AVANT L'ENVOI » par les adresses e-mail réelles de Oumar et
-> Frédéric. L'énoncé (Question 0.1) impose la présence des trois adresses.
+| **Membre A** — Data Ingestion & Platform Engineer | BANIGANTE Kpapou | firminapp@gmail.com | `Kpapou BANIGANTE` |
+| **Membre B** — Data Transformation Engineer | CAMARA Oumar | camou.oumar@gmail.com | `Oumar CAMARA` |
+| **Membre C** — Analytics & Performance Engineer | CHAKVOURNE Frédéric | fredericchakvourne33@gmail.com | `Frederic CHAKVOURNE` |
 
 Un même rôle n'est occupé que par une seule personne, conformément à la
 Question 0.1.
@@ -82,8 +78,12 @@ son identité sur son poste avant de commiter :
 
 ```bash
 git config user.name  "Kpapou BANIGANTE"
-git config user.email "kpapou.banigante@gozem.co"
+git config user.email "firminapp@gmail.com"
 ```
+
+Les adresses configurées dans Git sont exactement celles du tableau ci-dessus :
+`firminapp@gmail.com`, `camou.oumar@gmail.com` et `fredericchakvourne33@gmail.com`.
+Chaque commit est donc rattachable sans ambiguïté à son auteur.
 
 Vérification de l'historique :
 
