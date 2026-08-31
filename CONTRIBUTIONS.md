@@ -1,4 +1,4 @@
-# CONTRIBUTIONS.md — GROUPE 3
+# CONTRIBUTIONS.md — GROUPE 6
 
 **Projet Final Data Engineer — Spark & Scala**
 BANIGANTE Kpapou (Membre A) · CAMARA Oumar (Membre B) · CHAKVOURNE Frédéric (Membre C)

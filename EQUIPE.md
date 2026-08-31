@@ -1,4 +1,4 @@
-# EQUIPE.md — GROUPE 3
+# EQUIPE.md — GROUPE 6
 
 **Projet Final — Data Engineer : Spark & Scala**
 Système d'analyse de données e-commerce distribué

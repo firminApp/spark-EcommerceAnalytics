@@ -1,6 +1,6 @@
 # EcommerceAnalytics — Système d'analyse de données e-commerce distribué
 
-**Projet Final Data Engineer — Spark & Scala — GROUPE 3**
+**Projet Final Data Engineer — Spark & Scala — GROUPE 6**
 BANIGANTE Kpapou · CAMARA Oumar · CHAKVOURNE Frédéric
 
 Pipeline Spark complet : ingestion multi-format (CSV / JSON / Parquet),
