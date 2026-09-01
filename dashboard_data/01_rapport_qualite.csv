@@ -1,0 +1,5 @@
+dataset,nb_lignes_lues,nb_lignes_valides,nb_lignes_rejetees,taux_rejet,nb_valeurs_nulles,nb_refs_orphelines_user,nb_refs_orphelines_product,nb_refs_orphelines_merchant
+transactions,138047,136157,1890,1.37,940,4273,4324,3133
+users,12000,11655,345,2.88,160,,,
+products,6000,5821,179,2.98,55,,,
+merchants,600,586,14,2.33,9,,,
