@@ -6,272 +6,244 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
 /**
- * Analytique business (Partie 4 — Questions 4.1, 4.2 et bonus 4.3 / 4.4).
+ * Résultats composites renvoyés par [[Analytics]] — regroupés ici plutôt que
+ * dans la classe elle-même par cohérence avec le reste du projet (une case
+ * class imbriquée dans une classe pose problème pour les encodeurs Spark ;
+ * ces case class ne contiennent que des DataFrame, jamais sérialisées via un
+ * Dataset, donc le risque ne s'applique pas ici, mais la convention est gardée).
+ */
+object Analytics {
+
+  /** Question 4.2 — analyse de cohortes. */
+  case class CohortResult(
+      cohortSizes: DataFrame, // cohort_month, nb_utilisateurs_initiaux
+      retention: DataFrame,   // cohort_month, period_index, nb_utilisateurs_actifs, nb_utilisateurs_initiaux, taux_retention_pct
+      bestAtFocus: DataFrame  // retention filtrée à app.business.retention-focus-period, triée par taux décroissant
+  )
+
+  /** Bonus 4.3 — segmentation RFM. */
+  case class RfmResult(
+      scores: DataFrame,       // user_id, recence_jours, frequence, montant, r_score, f_score, m_score, segment_rfm
+      distribution: DataFrame, // segment_rfm, nb_clients
+      crossTab: DataFrame      // segment_rfm x customer_segment déclaré (pivot)
+  )
+
+  /** Bonus 4.4 — analyse produits et catégories. */
+  case class ProductAnalysisResult(
+      topProduits: DataFrame,        // top N par chiffre d'affaires
+      parCategorieRegion: DataFrame, // product_category x merchant_region + part relative
+      parPaiementPeriode: DataFrame  // payment_method x day_period
+  )
+}
+
+/**
+ * Analytique business (Partie 4 — Questions 4.1, 4.2, bonus 4.3, bonus 4.4).
  *
- * Propriétaire : Membre C (CHAKVOURNE Frédéric) — Relecteur : Membre B.
+ * Propriétaire : Membre C (CHAKVOURNE Frédéric).
+ * Relecteur : Membre B (Q4.1 / Q4.2), Membre A (bonus 4.3 / bonus 4.4).
  *
- * Toutes les fonctions prennent en entrée le DataFrame **enrichi** produit par
- * [[DataTransformation]] : elles ne refont ni jointure ni parsing de date, ce
- * qui évite de relire les sources et permet de bénéficier du cache (Q5.1).
+ * Consomme le DataFrame enrichi produit par `DataTransformation.run(...)`
+ * (Membre B) : colonnes `merchant_region`, `merchant_category`, `age_group`,
+ * `tx_date`, `tx_month`, `product_category`, `product_rating`,
+ * `product_stock`, `payment_method`, `day_period`, `customer_segment`, etc.
  */
 class Analytics(spark: SparkSession, config: ConfigLoader) extends Serializable {
 
-  import spark.implicits._
-
-  private def r2(c: org.apache.spark.sql.Column) = round(c, 2)
+  import Analytics._
 
   // ==========================================================================
   //  Question 4.1 — rapport détaillé par marchand
   // ==========================================================================
 
   /**
-   * KPI par marchand : chiffre d'affaires, volumétrie, panier moyen, commission
-   * perçue, classements par catégorie et par région, taux de transactions
-   * suspectes (bonus 3.4).
+   * CA total, nombre de transactions, clients uniques, montant moyen,
+   * commission totale, classement par catégorie et par région, répartition
+   * des ventes par tranche d'âge (pivot sur `age_group`).
    *
-   * Le classement utilise `dense_rank` : deux marchands à chiffre d'affaires
-   * strictement égal partagent le même rang sans « trouer » la numérotation.
+   * `dense_rank()` plutôt que `rank()` : ce dernier laisse des « trous » dans
+   * le classement en cas d'ex-æquo, corrigé lors de la relecture croisée du
+   * 24/08 (cf. CONTRIBUTIONS.md).
    */
   def merchantReport(enriched: DataFrame): DataFrame = {
-    val hasSuspicious = enriched.columns.contains("is_suspicious")
+    val base = enriched
+      .groupBy("merchant_id", "merchant_name", "merchant_category", "merchant_region", "commission_rate")
+      .agg(
+        round(sum("amount"), 2).as("chiffre_affaires_total"),
+        count("transaction_id").as("nb_transactions"),
+        countDistinct("user_id").as("nb_clients_uniques"),
+        round(avg("amount"), 2).as("montant_moyen_transaction"),
+        round(sum("amount") * first("commission_rate"), 2).as("commission_totale")
+      )
 
-    val baseAggs = Seq(
-      r2(sum("amount")).as("chiffre_affaires"),
-      count(lit(1)).as("nb_transactions"),
-      countDistinct(col("user_id")).as("nb_clients_uniques"),
-      r2(avg("amount")).as("montant_moyen"),
-      r2(sum(col("amount") * coalesce(col("commission_rate"), lit(0.0)))).as("commission_totale")
-    )
+    val wCategory = Window.partitionBy("merchant_category").orderBy(col("chiffre_affaires_total").desc)
+    val wRegion   = Window.partitionBy("merchant_region").orderBy(col("chiffre_affaires_total").desc)
 
-    val suspiciousAggs =
-      if (hasSuspicious)
-        Seq(
-          sum(col("is_suspicious")).as("nb_transactions_suspectes"),
-          r2(avg(col("is_suspicious")) * 100.0).as("taux_transactions_suspectes_pct")
-        )
-      else Seq.empty
-
-    val aggs = baseAggs ++ suspiciousAggs
-
-    val grouped = enriched
-      .groupBy("merchant_id", "merchant_name", "merchant_category", "merchant_region")
-      .agg(aggs.head, aggs.tail: _*)
-
-    // Classements par chiffre d'affaires (fonctions de fenêtrage).
-    val wCategory = Window.partitionBy("merchant_category").orderBy(col("chiffre_affaires").desc)
-    val wRegion   = Window.partitionBy("merchant_region").orderBy(col("chiffre_affaires").desc)
-
-    val ranked = grouped
+    val ranked = base
       .withColumn("rang_categorie", dense_rank().over(wCategory))
-      .withColumn("rang_region",    dense_rank().over(wRegion))
+      .withColumn("rang_region", dense_rank().over(wRegion))
 
-    // Répartition des ventes par tranche d'âge des clients (pivot).
-    val byAge = enriched
+    val ageBreakdown = enriched
       .groupBy("merchant_id")
       .pivot("age_group", Seq("Jeune", "Adulte", "Age Moyen", "Senior", "Inconnu"))
-      .agg(r2(sum("amount")))
+      .agg(round(sum("amount"), 2))
       .na.fill(0.0)
-      .withColumnRenamed("Jeune",     "ca_jeune")
-      .withColumnRenamed("Adulte",    "ca_adulte")
-      .withColumnRenamed("Age Moyen", "ca_age_moyen")
-      .withColumnRenamed("Senior",    "ca_senior")
-      .withColumnRenamed("Inconnu",   "ca_age_inconnu")
 
-    ranked.join(byAge, Seq("merchant_id"), "left").orderBy(col("chiffre_affaires").desc)
+    ranked
+      .join(ageBreakdown, Seq("merchant_id"), "left")
+      .orderBy(col("chiffre_affaires_total").desc)
   }
 
   // ==========================================================================
-  //  Question 4.2 — analyse de cohortes
+  //  Question 4.2 — analyse de cohortes utilisateurs
   // ==========================================================================
 
-  /** Résultats de l'analyse de cohortes. */
-  case class CohortResult(
-      cohortSizes: DataFrame,   // cohort_month, nb_utilisateurs_initiaux
-      retention: DataFrame,     // matrice (cohort_month, period_index)
-      bestAtFocus: DataFrame    // meilleure cohorte à N mois
-  )
-
   /**
-   * Cohortes fondées sur le **mois de première transaction** de chaque
-   * utilisateur (et non sur `registration_date` : l'énoncé demande le mois de
-   * première transaction, ce qui mesure la fidélité réelle et non l'inscription).
-   *
-   * `period_index` = nombre de mois entiers écoulés entre le mois de la
-   * transaction et le mois de la cohorte (0 pour le mois d'acquisition).
+   * Cohorte = mois de la PREMIÈRE TRANSACTION (`tx_month`), pas le mois
+   * d'inscription — cf. décision technique 4.b du groupe (fidélité réelle,
+   * pas acquisition marketing).
    */
   def cohortAnalysis(enriched: DataFrame): CohortResult = {
-    val txs = enriched
-      .filter(col("tx_date").isNotNull && col("user_id").isNotNull)
-      .select(col("user_id"), col("tx_date"), col("tx_month"), col("amount"))
-
-    // 1. Mois de première transaction par utilisateur.
-    val firstTx = txs
+    val firstPurchase = enriched
       .groupBy("user_id")
-      .agg(min(col("tx_date")).as("first_tx_date"))
-      .withColumn("cohort_month", date_format(col("first_tx_date"), "yyyy-MM"))
+      .agg(min("tx_month").as("cohort_month"))
 
-    // 2. Rattachement de chaque transaction à sa cohorte + indice de période.
-    val withCohort = txs
-      .join(firstTx, Seq("user_id"), "inner")
+    val cohortSizes = firstPurchase
+      .groupBy("cohort_month")
+      .agg(countDistinct("user_id").as("nb_utilisateurs_initiaux"))
+      .orderBy("cohort_month")
+
+    val withCohort = enriched
+      .join(firstPurchase, Seq("user_id"))
       .withColumn(
         "period_index",
-        months_between(trunc(col("tx_date"), "month"), trunc(col("first_tx_date"), "month")).cast("int")
+        months_between(
+          to_date(concat(col("tx_month"), lit("-01")), "yyyy-MM-dd"),
+          to_date(concat(col("cohort_month"), lit("-01")), "yyyy-MM-dd")
+        ).cast("int")
       )
 
-    // 3. Taille initiale de chaque cohorte.
-    val cohortSizes = firstTx
-      .groupBy("cohort_month")
-      .agg(countDistinct(col("user_id")).as("nb_utilisateurs_initiaux"))
-
-    // 4. Matrice de rétention (+ bonus : CA par cohorte et par période).
     val retention = withCohort
       .groupBy("cohort_month", "period_index")
-      .agg(
-        countDistinct(col("user_id")).as("nb_utilisateurs_actifs"),
-        r2(sum("amount")).as("chiffre_affaires")
+      .agg(countDistinct("user_id").as("nb_utilisateurs_actifs"))
+      .join(cohortSizes, Seq("cohort_month"))
+      .withColumn(
+        "taux_retention_pct",
+        round(col("nb_utilisateurs_actifs") * lit(100.0) / col("nb_utilisateurs_initiaux"), 2)
       )
-      .join(cohortSizes, Seq("cohort_month"), "inner")
-      .withColumn("taux_retention_pct", r2(col("nb_utilisateurs_actifs") * 100.0 / col("nb_utilisateurs_initiaux")))
-      .withColumn("revenu_moyen_par_utilisateur", r2(col("chiffre_affaires") / col("nb_utilisateurs_actifs")))
-      .orderBy(col("cohort_month"), col("period_index"))
+      .orderBy("cohort_month", "period_index")
 
-    // 5. Meilleure cohorte à N mois (N = app.business.retention-focus-period).
     val bestAtFocus = retention
       .filter(col("period_index") === lit(config.retentionFocusPeriod))
       .orderBy(col("taux_retention_pct").desc)
 
-    CohortResult(cohortSizes.orderBy("cohort_month"), retention, bestAtFocus)
+    CohortResult(cohortSizes, retention, bestAtFocus)
   }
 
-  /** Matrice de rétention pivotée : une ligne par cohorte, une colonne par période. */
-  def retentionMatrix(retention: DataFrame, maxPeriod: Int = 12): DataFrame =
+  /** Pivot de `retention` : une ligne par cohorte, une colonne par mois écoulé (period_index). */
+  def retentionMatrix(retention: DataFrame): DataFrame =
     retention
-      .filter(col("period_index").between(0, maxPeriod))
-      .groupBy("cohort_month", "nb_utilisateurs_initiaux")
-      .pivot("period_index", (0 to maxPeriod).map(_.toString))
-      .agg(first(col("taux_retention_pct")))
+      .groupBy("cohort_month")
+      .pivot("period_index")
+      .agg(first("taux_retention_pct"))
       .orderBy("cohort_month")
 
   // ==========================================================================
   //  Bonus 4.3 — segmentation RFM
   // ==========================================================================
 
-  /** Résultats de la segmentation RFM. */
-  case class RfmResult(scores: DataFrame, distribution: DataFrame, crossTab: DataFrame)
-
   /**
-   * Récence / Fréquence / Montant, scorés de 1 à 5 par quintiles (`ntile`).
+   * Score 1 à `app.business.rfm-quantiles` (5 par défaut) sur Récence,
+   * Fréquence, Montant, puis règle métier combinant les trois scores.
    *
-   * Convention de score : pour la récence, **plus le nombre de jours est petit,
-   * meilleur est le client** — le tri est donc décroissant afin que le score 5
-   * corresponde toujours au meilleur profil sur les trois axes.
-   *
-   * Règles d'affectation retenues par le groupe (à justifier en soutenance) :
-   *   - Champions      : R ≥ 4 et F ≥ 4 et M ≥ 4 — récents, fréquents, dépensiers ;
-   *   - Clients fidèles: F ≥ 4 et R ≥ 3 — reviennent régulièrement ;
-   *   - Nouveaux       : R ≥ 4 et F ≤ 2 — arrivés récemment, peu d'historique ;
-   *   - À risque       : R ≤ 2 et F ≥ 3 — bons clients qui ne reviennent plus ;
-   *   - Perdus         : le reste (R ≤ 2 et F ≤ 2 principalement).
-   * L'ordre d'évaluation est important : la première règle satisfaite gagne.
+   * Point d'attention (difficulté rencontrée, cf. CONTRIBUTIONS.md) : `ntile`
+   * sur un tri croissant de `recence_jours` donnerait le score 5 au client le
+   * PLUS ANCIEN. Tri en DÉCROISSANT pour que le score 5 corresponde toujours
+   * au client le plus récent, cohérent avec fréquence et montant.
    */
   def rfmSegmentation(enriched: DataFrame): RfmResult = {
-    // Date de référence = date la plus récente du jeu de données (et non la date
-    // du jour) : la récence reste ainsi reproductible d'une exécution à l'autre.
-    val refRow = enriched.agg(max(col("tx_date"))).head()
-    val refDate =
-      if (refRow.isNullAt(0)) java.sql.Date.valueOf(java.time.LocalDate.now())
-      else refRow.getDate(0)
+    val maxDateRow = enriched.agg(max("tx_date").as("max_date")).first()
+    val maxDate    = maxDateRow.getAs[java.sql.Date]("max_date")
+    val q          = config.rfmQuantiles
 
     val rfm = enriched
-      .filter(col("user_id").isNotNull && col("tx_date").isNotNull)
       .groupBy("user_id")
       .agg(
-        max(col("tx_date")).as("derniere_transaction"),
-        count(lit(1)).as("frequence"),
-        r2(sum("amount")).as("montant")
+        datediff(lit(maxDate), max("tx_date")).as("recence_jours"),
+        count("transaction_id").as("frequence"),
+        round(sum("amount"), 2).as("montant")
       )
-      .withColumn("recence_jours", datediff(lit(refDate), col("derniere_transaction")))
 
-    val q = config.rfmQuantiles
     val scored = rfm
-      .withColumn("score_r", ntile(q).over(Window.orderBy(col("recence_jours").desc)))
-      .withColumn("score_f", ntile(q).over(Window.orderBy(col("frequence").asc)))
-      .withColumn("score_m", ntile(q).over(Window.orderBy(col("montant").asc)))
-      .withColumn("score_rfm", concat(col("score_r"), col("score_f"), col("score_m")))
-      .withColumn(
-        "segment_rfm",
-        when(col("score_r") >= 4 && col("score_f") >= 4 && col("score_m") >= 4, lit("Champions"))
-          .when(col("score_f") >= 4 && col("score_r") >= 3, lit("Clients fideles"))
-          .when(col("score_r") >= 4 && col("score_f") <= 2, lit("Nouveaux"))
-          .when(col("score_r") <= 2 && col("score_f") >= 3, lit("A risque"))
-          .otherwise(lit("Perdus"))
-      )
+      .withColumn("r_score", ntile(q).over(Window.orderBy(col("recence_jours").desc)))
+      .withColumn("f_score", ntile(q).over(Window.orderBy(col("frequence").asc)))
+      .withColumn("m_score", ntile(q).over(Window.orderBy(col("montant").asc)))
 
-    val distribution = scored
+    // Seuils exprimés relativement à q pour rester cohérents si rfm-quantiles
+    // change dans application.conf (q=5 par défaut -> seuils 4 / 3 / 2).
+    val scores = scored.withColumn(
+      "segment_rfm",
+      when(col("r_score") >= q - 1 && col("f_score") >= q - 1 && col("m_score") >= q - 1, lit("Champions"))
+        .when(col("r_score") >= q - 2 && col("f_score") >= q - 2, lit("Clients fideles"))
+        .when(col("r_score") <= 2 && col("f_score") >= q - 2, lit("A risque"))
+        .when(col("r_score") <= 2 && col("f_score") <= 2, lit("Perdus"))
+        .otherwise(lit("Nouveaux"))
+    )
+
+    val distribution = scores
       .groupBy("segment_rfm")
-      .agg(
-        count(lit(1)).as("nb_clients"),
-        r2(avg("recence_jours")).as("recence_moyenne_jours"),
-        r2(avg("frequence")).as("frequence_moyenne"),
-        r2(avg("montant")).as("montant_moyen")
-      )
+      .agg(count(lit(1)).as("nb_clients"))
       .orderBy(col("nb_clients").desc)
 
-    // Tableau croisé segment RFM calculé × customer_segment déclaré dans users.json.
-    val declared = enriched.select("user_id", "customer_segment").distinct()
-    val crossTab = scored
-      .join(declared, Seq("user_id"), "left")
+    // customer_segment est porté par chaque transaction dans `enriched` : on
+    // en extrait une valeur par utilisateur avant de croiser avec le RFM calculé.
+    val declaredSegment = enriched.select("user_id", "customer_segment").dropDuplicates("user_id")
+
+    val crossTab = scores
+      .join(declaredSegment, Seq("user_id"), "left")
       .groupBy("segment_rfm")
       .pivot("customer_segment")
-      .agg(count(lit(1)))
-      .na.fill(0L)
+      .count()
+      .na.fill(0)
       .orderBy("segment_rfm")
 
-    RfmResult(scored, distribution, crossTab)
+    RfmResult(scores, distribution, crossTab)
   }
 
   // ==========================================================================
   //  Bonus 4.4 — analyse produits et catégories
   // ==========================================================================
 
-  case class ProductResult(topProduits: DataFrame, parCategorieRegion: DataFrame, parPaiementPeriode: DataFrame)
+  def productAnalysis(enriched: DataFrame): ProductAnalysisResult = {
 
-  def productAnalysis(enriched: DataFrame): ProductResult = {
-    // 1. Top N produits par chiffre d'affaires.
     val topProduits = enriched
-      .groupBy("product_id", "product_name", "product_category")
+      .groupBy("product_id", "product_name")
       .agg(
-        r2(sum("amount")).as("chiffre_affaires"),
-        count(lit(1)).as("nb_transactions"),
-        r2(avg("product_rating")).as("note_moyenne"),
-        max(col("product_stock")).as("stock_disponible")
+        round(sum("amount"), 2).as("chiffre_affaires"),
+        round(avg("product_rating"), 2).as("note_moyenne"),
+        first("product_stock").as("stock_disponible")
       )
       .orderBy(col("chiffre_affaires").desc)
       .limit(config.topProducts)
 
-    // 2. CA et volumétrie par catégorie et par région, avec le poids relatif
-    //    de chaque catégorie dans sa région (fonction de fenêtrage).
-    val wRegion = Window.partitionBy("merchant_region")
-    val parCategorieRegion = enriched
-      .groupBy("merchant_region", "category")
+    val byCatRegion = enriched
+      .groupBy("product_category", "merchant_region")
       .agg(
-        r2(sum("amount")).as("chiffre_affaires"),
-        count(lit(1)).as("nb_transactions")
+        round(sum("amount"), 2).as("chiffre_affaires"),
+        count("transaction_id").as("nb_transactions")
       )
-      .withColumn("ca_region", sum(col("chiffre_affaires")).over(wRegion))
-      .withColumn("part_dans_region_pct", r2(col("chiffre_affaires") * 100.0 / col("ca_region")))
+    val wRegion = Window.partitionBy("merchant_region")
+    val parCategorieRegion = byCatRegion
+      .withColumn(
+        "pct_categorie_dans_region",
+        round(col("chiffre_affaires") / sum("chiffre_affaires").over(wRegion) * 100, 2)
+      )
       .orderBy(col("merchant_region"), col("chiffre_affaires").desc)
 
-    // 3. Répartition du CA par méthode de paiement et période de la journée.
     val parPaiementPeriode = enriched
       .groupBy("payment_method", "day_period")
-      .agg(
-        r2(sum("amount")).as("chiffre_affaires"),
-        count(lit(1)).as("nb_transactions"),
-        r2(avg("amount")).as("montant_moyen")
-      )
-      .orderBy(col("payment_method"), col("chiffre_affaires").desc)
+      .agg(round(sum("amount"), 2).as("chiffre_affaires"))
+      .orderBy("payment_method", "day_period")
 
-    ProductResult(topProduits, parCategorieRegion, parPaiementPeriode)
+    ProductAnalysisResult(topProduits, parCategorieRegion, parPaiementPeriode)
   }
 }
